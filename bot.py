@@ -195,6 +195,10 @@ usage_stats: dict[int, dict] = {}
 # /retry 用の直前 prompt (thread → prompt 本文)
 last_prompts: dict[int, str] = {}
 
+# AskUserQuestion の「自由入力」待ち。thread_id → (request_id, user_id, hook_type)
+# 次にそのユーザーが投稿したメッセージが回答として吸い上げられる
+pending_freetext: dict[int, tuple[str, int, str]] = {}
+
 
 # ==============================
 # 権限管理
@@ -366,7 +370,7 @@ class PermissionView(discord.ui.View):
 
 
 class QuestionView(discord.ui.View):
-    """AskUserQuestion 用: 選択肢ボタンを並べる"""
+    """AskUserQuestion 用: 選択肢ボタン + 自由入力ボタン"""
 
     def __init__(self, request_id: str, thread_id: str, hook_type: str, options: list):
         super().__init__(timeout=600)
@@ -374,7 +378,8 @@ class QuestionView(discord.ui.View):
         self.thread_id = thread_id
         self.hook_type = hook_type
         self._resolved = False
-        for i, label in enumerate(options[:20]):
+        # ボタンは最大 25 個。「その他」用に 1 枠空けて 24 個まで選択肢ボタンに
+        for i, label in enumerate(options[:24]):
             btn = discord.ui.Button(
                 label=(label or f"選択肢{i+1}")[:80],
                 style=discord.ButtonStyle.primary,
@@ -382,6 +387,15 @@ class QuestionView(discord.ui.View):
             )
             btn.callback = self._make_callback(label)
             self.add_item(btn)
+        # 「その他（自由入力）」ボタン
+        free_btn = discord.ui.Button(
+            label="その他（自由入力）",
+            style=discord.ButtonStyle.secondary,
+            emoji="✏️",
+            custom_id=f"q_{request_id}_free",
+        )
+        free_btn.callback = self._free_callback
+        self.add_item(free_btn)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if str(interaction.user.id) not in ALLOWED_USERS:
@@ -427,6 +441,13 @@ class QuestionView(discord.ui.View):
                 except (discord.NotFound, discord.HTTPException):
                     pass
                 return
+            # 自由入力待ちエントリがあればクリア
+            try:
+                tid_int = int(self.thread_id)
+                if pending_freetext.get(tid_int, (None, 0, ""))[0] == self.request_id:
+                    pending_freetext.pop(tid_int, None)
+            except (ValueError, TypeError):
+                pass
             self.stop()
             try:
                 await interaction.response.edit_message(content=f"✅ 回答: {answer[:200]}", view=None)
@@ -434,8 +455,40 @@ class QuestionView(discord.ui.View):
                 log.warning("質問応答編集失敗: %s", e)
         return cb
 
+    async def _free_callback(self, interaction: discord.Interaction):
+        if self._resolved:
+            try:
+                await interaction.response.edit_message(content="既に回答済みです", view=None)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+        # このスレッドの次メッセージを回答として吸い上げる予約
+        try:
+            tid_int = int(self.thread_id)
+        except (ValueError, TypeError):
+            return
+        pending_freetext[tid_int] = (self.request_id, interaction.user.id, self.hook_type)
+        try:
+            await interaction.response.edit_message(
+                content=(
+                    "✏️ **自由入力モード**\n"
+                    f"このスレッドに次にメッセージを書き込むとそれが回答になります "
+                    f"(<@{interaction.user.id}> の投稿のみ受付、10 分でタイムアウト)"
+                ),
+                view=None,
+            )
+        except (discord.NotFound, discord.HTTPException) as e:
+            log.warning("自由入力ボタン応答編集失敗: %s", e)
+
     async def on_timeout(self):
         if self.request_id in permission_events and not self._resolved:
+            # 自由入力待ちもクリア
+            try:
+                tid_int = int(self.thread_id)
+                if pending_freetext.get(tid_int, (None, 0, ""))[0] == self.request_id:
+                    pending_freetext.pop(tid_int, None)
+            except (ValueError, TypeError):
+                pass
             self._resolve("（タイムアウト）")
 
 
@@ -1949,6 +2002,15 @@ async def show_help(interaction: discord.Interaction):
         ),
         inline=False,
     )
+    embed.add_field(
+        name="⚡ メッセージ操作",
+        value=(
+            "`!stop` `!cancel` `!interrupt` — 走行中の claude を即 kill\n"
+            "質問の **✏️ その他（自由入力）** ボタン — 次に送るメッセージが回答になる\n"
+            "走行中にメッセージを送ると 📥 でキューに追加され、現ターン完了後に順次処理"
+        ),
+        inline=False,
+    )
     embed.add_field(name="🔄 同期", value="`!sync` — スラッシュコマンドを Discord に同期（コマンド変更時に1回）", inline=False)
     embed.set_footer(text="画像添付にも対応。途中経過のツール使用も表示されます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -2171,6 +2233,35 @@ async def resume_session(interaction: discord.Interaction, session_id: str, titl
     await enqueue_for_thread(thread, message, initial_prompt)
 
 
+def _build_question_response(answer: str, hook_type: str) -> dict:
+    reason = f"User answered: {answer}. Treat this as the user's answer and continue."
+    if hook_type == "PermissionRequest":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "deny", "message": reason},
+            }
+        }
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+# 割り込みコマンドとして扱う prompt
+_INTERRUPT_KEYWORDS = {"!stop", "!cancel", "!interrupt", "！stop", "！cancel"}
+
+
+async def _safe_react(message: discord.Message, emoji: str):
+    try:
+        await message.add_reaction(emoji)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -2185,6 +2276,37 @@ async def on_message(message: discord.Message):
     if str(message.author.id) not in ALLOWED_USERS:
         return
 
+    thread = message.channel
+    raw_text = (message.content or "").strip()
+
+    # ── ① AskUserQuestion の自由入力待ち: 次メッセージを回答に変換 ──
+    pending = pending_freetext.get(thread.id)
+    if pending is not None:
+        req_id, expected_user, hook_type = pending
+        if message.author.id == expected_user and raw_text:
+            pending_freetext.pop(thread.id, None)
+            permission_results[req_id] = _build_question_response(raw_text, hook_type)
+            ev = permission_events.get(req_id)
+            if ev:
+                ev.set()
+            await _safe_react(message, "✏️")
+            return
+
+    # ── ② インライン割り込み: !stop / !cancel / !interrupt ──
+    if raw_text.lower() in _INTERRUPT_KEYWORDS:
+        proc = get_thread_proc(thread.id)
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+                await _safe_react(message, "🛑")
+                await safe_send(thread, f"🛑 走行中の claude を kill しました (<@{message.author.id}>)")
+            except Exception as e:
+                await safe_send(thread, f"kill 失敗: {e}")
+        else:
+            await _safe_react(message, "💤")
+            await safe_send(thread, "（走行中の claude はありません）")
+        return
+
     prompt = message.content or ""
 
     image_paths = await download_attachments(message)
@@ -2197,7 +2319,18 @@ async def on_message(message: discord.Message):
         cleanup_attachments(image_paths)
         return
 
-    await enqueue_for_thread(message.channel, message, prompt, image_paths=image_paths)
+    # ── ③ キュー表示: 走行中ならリアクション + 待機数表示 ──
+    running_proc = get_thread_proc(thread.id)
+    if running_proc and running_proc.poll() is None:
+        existing_q = thread_queues.get(thread.id)
+        qsize = existing_q.qsize() if existing_q else 0
+        await _safe_react(message, "📥")
+        await safe_send(
+            thread,
+            f"📥 キューに追加しました ({qsize + 1} 件待機中、現在のターン完了後に順次処理)",
+        )
+
+    await enqueue_for_thread(thread, message, prompt, image_paths=image_paths)
 
 
 @bot.event

@@ -162,6 +162,14 @@ A progress message updates line-by-line as Claude calls tools (TUI-style):
 
 Edits are rate-limited to once every 1.5 seconds to stay under Discord's limits.
 
+### Inline interactions
+
+| Action | Description |
+|---|---|
+| `!stop` / `!cancel` / `!interrupt` | Send in a thread to immediately kill the running claude |
+| **✏️ Other (free input)** button | Always added to AskUserQuestion choices. After clicking, the next message you send becomes the answer |
+| Sending a message while running | Adds 📥 reaction + "N queued" notice. Processed sequentially after the current turn |
+
 ## Permission Mode
 
 When `SKIP_PERMISSIONS=false` (default), Discord buttons appear whenever Claude Code attempts to use tools like file editing or command execution.
