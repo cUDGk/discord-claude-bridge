@@ -188,6 +188,31 @@ def _kill_all_procs():
 
 atexit.register(_kill_all_procs)
 
+# 自分自身の PID を bot.pid に書く（restart helper や運用者用）
+_BOT_PID_FILE = Path(__file__).parent / "bot.pid"
+
+
+def _write_pid_file():
+    try:
+        _BOT_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as e:
+        log.warning("bot.pid 書き込み失敗: %s", e)
+
+
+def _remove_pid_file():
+    try:
+        if _BOT_PID_FILE.exists():
+            content = _BOT_PID_FILE.read_text(encoding="utf-8").strip()
+            # 自分のPIDが書かれてる場合だけ削除（他の bot に上書きされてたら触らない）
+            if content == str(os.getpid()):
+                _BOT_PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+_write_pid_file()
+atexit.register(_remove_pid_file)
+
 # /cwd で固定された thread → cwd
 thread_cwds: dict[int, str] = {}
 # /usage 用の累積使用量 (thread → {"input_tokens": N, "output_tokens": N, "cost_usd": float, "turns": N})
