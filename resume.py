@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """bridge セッション専用の resume ピッカー（PC側）。
 
-なぜ要るか: bridge は `claude -p`（ヘッドレス）でセッションを作る。Claude Code の
-ネイティブ `/resume`・`claude --resume` のピッカーは「作成時の出自」で対話セッションだけを
-表示し、`-p` 由来のセッションは原理的に一覧へ出ない（後から対話 resume しても出ない事を実機で確認済み）。
-そのため bridge で回した会話はネイティブのピッカーから選べない。
+背景: bridge は `claude -p`（ヘッドレス）でセッションを作る。Claude Code のネイティブ
+`/resume`・`claude --resume` ピッカーは各レコードの出自タグ(entrypoint/promptSource)で
+対話セッションだけを一覧し、`-p` 由来 (sdk-cli/sdk) を除外する。bot.py がこのタグを
+cli/typed に自動 promote するのでネイティブピッカーにも出るが、このスクリプトは
+「bridge セッションだけを手早く一覧して番号で resume したい」時の代替。
 
-このスクリプトは sessions.json が追跡している bridge セッションだけを新しい順に並べ、
-番号で選ぶと `claude --resume <id>` を“元の cwd から”起動する。ID 指定 resume は cwd
-スコープなので、記録された cwd で開かないと `No conversation found` になる点に対応している。
+sessions.json が追跡している bridge セッションを新しい順に並べ、番号で選ぶと
+`claude --resume <id>` を“元の cwd から”起動する。ID 指定 resume は cwd スコープなので、
+記録された cwd で開かないと `No conversation found` になる点に対応している。
 
 使い方:
   python resume.py          一覧を出して番号で選んで resume
