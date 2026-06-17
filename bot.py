@@ -1625,13 +1625,6 @@ async def _run_one(
                 await set_session_id(thread_key, new_session_id)
                 if not session_id:
                     await safe_send(thread, f"🆔 Session: `{new_session_id}`")
-            # bridge は claude -p で動くためこのセッションは Claude の /resume ピッカーに
-            # 出ない（entrypoint=sdk-cli/promptSource=sdk で除外される）。出自タグを
-            # cli/typed に書き換えてネイティブのピッカーへ出す。subprocess は終了済みなので
-            # ファイル書込みは安全。重いIOなので別スレッドで非ブロッキングに行う。
-            effective_sid = new_session_id or session_id
-            if effective_sid and not (is_error and new_session_id is None):
-                await asyncio.to_thread(promote_session_to_picker, effective_sid)
             if result_inner is not None or images:
                 await send_response(thread, result_inner or "", images)
             return result_inner or "", is_error
@@ -1718,24 +1711,6 @@ async def on_ready():
         + (f" / --permission-mode {PERMISSION_MODE}" if PERMISSION_MODE else ""),
     )
     await _validate_startup_targets()
-    # 既存の bridge セッションもネイティブ /resume ピッカーに出すため、起動時に一括 promote
-    # （重いIOなので別タスク・別スレッドで非ブロッキングに）
-    asyncio.create_task(_promote_all_sessions())
-
-
-async def _promote_all_sessions():
-    """sessions.json が追跡する全 bridge セッションのタグを一括で cli/typed に書き換える。"""
-    try:
-        sids = set(load_sessions().values())
-    except Exception as e:
-        log.warning("promote 一括: sessions.json 読込失敗: %s", e)
-        return
-    done = 0
-    for sid in sids:
-        if is_valid_session_id(sid):
-            await asyncio.to_thread(promote_session_to_picker, sid)
-            done += 1
-    log.info("起動時 promote 完了: %d セッションを /resume ピッカー対象に", done)
 
 
 async def download_attachments(message: discord.Message) -> list[Path]:
@@ -1826,68 +1801,6 @@ def find_session_cwd(session_id: str) -> str | None:
     except OSError as e:
         log.warning("プロジェクトディレクトリ走査失敗: %s", e)
     return None
-
-
-def _session_file_path(session_id: str) -> Path | None:
-    """`<session_id>.jsonl` を全プロジェクトディレクトリから探して返す。"""
-    if not is_valid_session_id(session_id):
-        return None
-    proj_dir = Path.home() / ".claude" / "projects"
-    if not proj_dir.exists():
-        return None
-    try:
-        for d in proj_dir.iterdir():
-            if d.is_dir():
-                fp = d / f"{session_id}.jsonl"
-                if fp.exists():
-                    return fp
-    except OSError as e:
-        log.warning("セッションファイル探索失敗: %s", e)
-    return None
-
-
-# Claude の出自タグ。-p/SDK 起動は sdk-cli/sdk、対話(TUI)は cli/typed。
-# /resume ピッカーは cli/typed のみ一覧し sdk を除外するので、cli/typed へ書き換える。
-_PICKER_TAG_FIXUPS = (
-    ('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'),
-    ('"promptSource":"sdk"', '"promptSource":"typed"'),
-)
-
-
-def promote_session_to_picker(session_id: str) -> None:
-    """claude -p セッションを Claude のネイティブ /resume ピッカーに出す。
-
-    ピッカーは各レコードの entrypoint/promptSource を見て対話セッションだけを一覧し、
-    -p/SDK 由来 (sdk-cli/sdk) を除外する。タグを cli/typed に書き換えて一覧へ出す。
-    冪等（既に cli の行はマッチせず素通り）。**claude subprocess の終了後に呼ぶ事**。
-    巨大ファイルの全書き換えになるので呼び出し側は別スレッドで実行する。
-    """
-    fp = _session_file_path(session_id)
-    if not fp:
-        return
-    tmp = fp.parent / (fp.name + ".promote_tmp")
-    try:
-        changed = False
-        # newline="" で改行を変換しない（元ファイルの \n を保つ）
-        with open(fp, "r", encoding="utf-8", newline="") as src, \
-                open(tmp, "w", encoding="utf-8", newline="") as dst:
-            for line in src:
-                if '"sdk' in line:  # 安価な事前判定で大半の行をスキップ
-                    for old, new in _PICKER_TAG_FIXUPS:
-                        if old in line:
-                            line = line.replace(old, new)
-                            changed = True
-                dst.write(line)
-        if changed:
-            os.replace(tmp, fp)
-        else:
-            tmp.unlink(missing_ok=True)
-    except OSError as e:
-        log.warning("セッションの promote 失敗 (%s): %s", session_id, e)
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _encode_home_path() -> str:
@@ -2017,8 +1930,8 @@ async def list_sessions(interaction: discord.Interaction, 件数: int = 10):
         )
     header = (
         "**PCのClaude Codeセッション一覧**\n"
-        "ℹ️ bridge セッションは自動 promote 済みで、PC の `claude --resume` / TUI `/resume` "
-        "ピッカーにも出ます。下のコマンドで直接開く事もできます（表示の cwd から実行）。\n\n"
+        "⚠️ bridge は `claude -p` で動くため、これらは `claude --resume` の対話ピッカーには出ません。"
+        "下のコマンドを（表示の cwd から）実行して開いてください。\n\n"
     )
     text = header + "\n\n".join(lines)
     for chunk in split_message(text, 2000):
@@ -2104,9 +2017,10 @@ async def show_help(interaction: discord.Interaction):
     embed.add_field(
         name="💻 PC側でターミナル resume",
         value=(
-            "bridge セッションは自動 promote されるので、PC の `claude --resume` / TUI "
-            "`/resume` ピッカーにそのまま出ます（各実行後と起動時にタグを書き換え）。\n"
-            "ピッカーを使わず一覧→番号選択したい時は PC で `python resume.py`。"
+            "bridge は `claude -p` で動くため、PC の `claude --resume` / TUI `/resume` の"
+            "ピッカーには出ません（仕様。出自で判定され後から変えられない）。\n"
+            "PC のターミナルで `python resume.py` を実行すると、bridge セッションを新しい順に"
+            "並べて番号で選び `claude --resume` を開けます。"
         ),
         inline=False,
     )
