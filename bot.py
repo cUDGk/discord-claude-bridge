@@ -1015,6 +1015,9 @@ def _run_claude_subprocess(
             env=env,
             cwd=cwd,
             bufsize=STREAM_LINE_BUFSIZE,
+            # bot を detached（コンソール無し）で起動すると、子の claude.exe が毎回
+            # 新しいコンソール窓を出してしまう。CREATE_NO_WINDOW で窓を出さない。
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
         )
     except FileNotFoundError:
         return [], (
