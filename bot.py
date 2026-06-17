@@ -1895,6 +1895,8 @@ def get_recent_sessions(limit: int = 10, exclude_discord: bool = False) -> list[
                 "mtime": mtime,
                 "date": dt,
                 "project": project,
+                # `claude --resume <id>` は ID 検索が cwd スコープなので、この cwd から実行しないと通らない
+                "cwd": decode_project_path(d.name) or "",
                 "first_msg": first_msg,
             })
 
@@ -1919,12 +1921,19 @@ async def list_sessions(interaction: discord.Interaction, 件数: int = 10):
 
     lines = []
     for i, s in enumerate(sessions, 1):
+        cwd = s.get("cwd") or ""
+        # cwd が分かれば「cd して resume」を1行で貼れる形に。不明なら ID だけ提示。
+        resume_cmd = f'cd "{cwd}" && claude --resume {s["session_id"]}' if cwd else f'claude --resume {s["session_id"]}'
         lines.append(
-            f"**{i}.** `{s['date']}` [{s['project']}]\n"
-            f"   `{s['session_id']}`\n"
-            f"   {s['first_msg'] or '（メッセージなし）'}"
+            f"**{i}.** `{s['date']}` [{s['project']}]  {s['first_msg'] or '（メッセージなし）'}\n"
+            f"   `{resume_cmd}`"
         )
-    text = "**PCのClaude Codeセッション一覧**\n\n" + "\n\n".join(lines)
+    header = (
+        "**PCのClaude Codeセッション一覧**\n"
+        "⚠️ bridge は `claude -p` で動くため、これらは `claude --resume` の対話ピッカーには出ません。"
+        "下のコマンドを（表示の cwd から）実行して開いてください。\n\n"
+    )
+    text = header + "\n\n".join(lines)
     for chunk in split_message(text, 2000):
         await interaction.followup.send(chunk, ephemeral=True)
 
