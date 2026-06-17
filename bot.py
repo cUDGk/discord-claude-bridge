@@ -2015,6 +2015,16 @@ async def show_help(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="💻 PC側でターミナル resume",
+        value=(
+            "bridge は `claude -p` で動くため、PC の `claude --resume` / TUI `/resume` の"
+            "ピッカーには出ません（仕様。出自で判定され後から変えられない）。\n"
+            "PC のターミナルで `python resume.py` を実行すると、bridge セッションを新しい順に"
+            "並べて番号で選び `claude --resume` を開けます。"
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="🧵 スレッド単位の操作 (スレッド内で実行)",
         value=(
             "`/bridge-info` — このスレッドのセッションID・cwd・許可ツール表示\n"
