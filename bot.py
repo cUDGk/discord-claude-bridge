@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 # Windows: aiodns が SelectorEventLoop を要求する問題を回避
 if sys.platform == "win32":
@@ -1630,6 +1631,11 @@ async def _run_one(
                     await safe_send(thread, f"🆔 Session: `{new_session_id}`")
             if result_inner is not None or images:
                 await send_response(thread, result_inner or "", images)
+            # 応答を返した“後”に、このセッションをネイティブ /resume ピッカーへ出す。
+            # 専用プール・fire-and-forget なので応答も run_claude も一切妨げない。
+            effective_sid = new_session_id or session_id
+            if effective_sid and not (is_error and new_session_id is None):
+                schedule_promote(effective_sid)
             return result_inner or "", is_error
 
         # typing() の Forbidden 等は __aenter__ で発生する。タイピング表示無しで継続。
@@ -1714,6 +1720,22 @@ async def on_ready():
         + (f" / --permission-mode {PERMISSION_MODE}" if PERMISSION_MODE else ""),
     )
     await _validate_startup_targets()
+    # 既存 bridge セッションもネイティブ /resume に出すため起動時に一括 promote。
+    # bot が応答を捌き始めてから、専用プールで直列処理（default executor を奪わない）。
+    asyncio.create_task(_promote_all_sessions())
+
+
+async def _promote_all_sessions():
+    """sessions.json の全 bridge セッションを専用プールへ投入してピッカー対象にする。"""
+    await asyncio.sleep(10)
+    try:
+        sids = [s for s in set(load_sessions().values()) if is_valid_session_id(s)]
+    except Exception as e:
+        log.warning("起動時 promote: sessions.json 読込失敗: %s", e)
+        return
+    for sid in sids:
+        schedule_promote(sid)
+    log.info("起動時 promote: %d セッションを投入（専用プールで直列処理）", len(sids))
 
 
 async def download_attachments(message: discord.Message) -> list[Path]:
@@ -1804,6 +1826,90 @@ def find_session_cwd(session_id: str) -> str | None:
     except OSError as e:
         log.warning("プロジェクトディレクトリ走査失敗: %s", e)
     return None
+
+
+def _session_file_path(session_id: str) -> Path | None:
+    """`<session_id>.jsonl` を全プロジェクトディレクトリから探して返す。"""
+    if not is_valid_session_id(session_id):
+        return None
+    proj_dir = Path.home() / ".claude" / "projects"
+    if not proj_dir.exists():
+        return None
+    try:
+        for d in proj_dir.iterdir():
+            if d.is_dir():
+                fp = d / f"{session_id}.jsonl"
+                if fp.exists():
+                    return fp
+    except OSError as e:
+        log.warning("セッションファイル探索失敗: %s", e)
+    return None
+
+
+# Claude の出自タグ。-p/SDK 起動は sdk-cli/sdk、対話(TUI)は cli/typed。
+# /resume ピッカーは cli/typed のみ一覧し sdk を除外するので cli/typed へ書き換える。
+_PICKER_TAG_FIXUPS = (
+    ('"entrypoint":"sdk-cli"', '"entrypoint":"cli"'),
+    ('"promptSource":"sdk"', '"promptSource":"typed"'),
+)
+
+# promote は専用の単一スレッドプールで回す。run_claude は _run_claude_subprocess を
+# asyncio.to_thread（＝default executor）で実行し、claude 実行中ずっとワーカーを占有する。
+# promote を default executor に乗せるとプールを奪い合って claude が起動できなくなる
+# （過去に無応答事故を起こした）。完全に別プールに隔離して run_claude を絶対に妨げない。
+_promote_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="promote")
+
+
+def promote_session_to_picker(session_id: str) -> None:
+    """claude -p セッションを Claude のネイティブ /resume ピッカーに出す（同期・冪等）。
+
+    ピッカーは各レコードの entrypoint/promptSource で対話セッションだけを一覧し -p/SDK 由来
+    を除外する。タグを cli/typed に書き換えて一覧へ出す。**claude subprocess の終了後**に呼ぶ事。
+    必ず _promote_pool 経由（schedule_promote）で呼び、default executor を奪わない。
+    """
+    fp = _session_file_path(session_id)
+    if not fp:
+        return
+    tmp = fp.parent / (fp.name + ".promote_tmp")
+    try:
+        changed = False
+        with open(fp, "r", encoding="utf-8", newline="") as src, \
+                open(tmp, "w", encoding="utf-8", newline="") as dst:
+            for line in src:
+                if '"sdk' in line:  # 安価な事前判定で大半の行をスキップ
+                    for old, new in _PICKER_TAG_FIXUPS:
+                        if old in line:
+                            line = line.replace(old, new)
+                            changed = True
+                dst.write(line)
+        if changed:
+            os.replace(tmp, fp)  # Windows: 対象が他プロセスで open 中だと失敗→下で握る
+        else:
+            tmp.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("セッションの promote 失敗 (%s): %s", session_id, e)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def schedule_promote(session_id: str):
+    """promote を専用プールへ fire-and-forget で投げる。応答経路を一切ブロックしない。"""
+    if not session_id:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    fut = loop.run_in_executor(_promote_pool, promote_session_to_picker, session_id)
+
+    def _on_done(f):
+        exc = f.exception()
+        if exc:
+            log.warning("promote タスク失敗 (%s): %s", session_id, exc)
+
+    fut.add_done_callback(_on_done)
 
 
 def _encode_home_path() -> str:
@@ -1933,8 +2039,8 @@ async def list_sessions(interaction: discord.Interaction, 件数: int = 10):
         )
     header = (
         "**PCのClaude Codeセッション一覧**\n"
-        "⚠️ bridge は `claude -p` で動くため、これらは `claude --resume` の対話ピッカーには出ません。"
-        "下のコマンドを（表示の cwd から）実行して開いてください。\n\n"
+        "ℹ️ bridge セッションは自動 promote 済みで、PC の `claude --resume` / TUI `/resume` "
+        "ピッカーにも出ます。下のコマンドで直接開く事もできます（表示の cwd から実行）。\n\n"
     )
     text = header + "\n\n".join(lines)
     for chunk in split_message(text, 2000):
@@ -2020,10 +2126,9 @@ async def show_help(interaction: discord.Interaction):
     embed.add_field(
         name="💻 PC側でターミナル resume",
         value=(
-            "bridge は `claude -p` で動くため、PC の `claude --resume` / TUI `/resume` の"
-            "ピッカーには出ません（仕様。出自で判定され後から変えられない）。\n"
-            "PC のターミナルで `python resume.py` を実行すると、bridge セッションを新しい順に"
-            "並べて番号で選び `claude --resume` を開けます。"
+            "bridge セッションは自動 promote されるので、PC の `claude --resume` / TUI "
+            "`/resume` ピッカーにそのまま出ます（各応答後と起動時にタグを書き換え）。\n"
+            "ピッカーを使わず一覧→番号選択したい時は PC で `python resume.py`。"
         ),
         inline=False,
     )
