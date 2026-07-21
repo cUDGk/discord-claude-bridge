@@ -77,6 +77,9 @@ SKIP_PERMISSIONS = os.getenv("SKIP_PERMISSIONS", "false").lower() in ("true", "1
 HOOK_PORT = int(os.getenv("HOOK_PORT", "8585"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
 
+# --model に渡す値。空なら未指定（claude のデフォルトモデル）。例: claude-sonnet-5 / sonnet / opus
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "").strip()
+
 # --permission-mode に渡す値。空なら未指定（claude のデフォルト）
 VALID_PERMISSION_MODES = {"", "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"}
 PERMISSION_MODE = os.getenv("PERMISSION_MODE", "").strip()
@@ -1111,6 +1114,8 @@ def _build_claude_args(prompt: str, session_id: str | None, settings_path: str) 
         "--output-format", "stream-json",
         "--verbose",
     ]
+    if CLAUDE_MODEL:
+        args.extend(["--model", CLAUDE_MODEL])
     if SKIP_PERMISSIONS:
         args.append("--dangerously-skip-permissions")
     elif PERMISSION_MODE:

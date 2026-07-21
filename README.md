@@ -84,6 +84,7 @@ cp .env.example .env
 | `SKIP_PERMISSIONS` | `true` で全操作を自動許可（デフォルト: `false`） |
 | `HOOK_PORT` | 権限リクエスト用の内部ポート（デフォルト: `8585`） |
 | `CLAUDE_BIN` | `claude` 実行ファイル名/絶対パス（デフォルト: `claude`） |
+| `CLAUDE_MODEL` | `--model` 値（例: `claude-sonnet-5` / `sonnet` / `opus`、空で claude のデフォルト） |
 | `PERMISSION_MODE` | `--permission-mode` 値（`default` / `acceptEdits` / `plan` / `auto` / `dontAsk` / `bypassPermissions` / 空） |
 | `MAX_TURNS` | 1ターンの最大エージェント実行回数（空で無制限） |
 | `MAX_BUDGET_USD` | 1ターンの最大コスト USD（空で無制限） |

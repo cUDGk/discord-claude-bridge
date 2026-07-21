@@ -85,6 +85,7 @@ Edit `.env` with the following:
 | `SKIP_PERMISSIONS` | Set `true` to auto-allow all operations (default: `false`) |
 | `HOOK_PORT` | Internal port for permission requests (default: `8585`) |
 | `CLAUDE_BIN` | `claude` executable name/path (default: `claude`) |
+| `CLAUDE_MODEL` | `--model` value (e.g. `claude-sonnet-5` / `sonnet` / `opus`, empty = claude default) |
 | `PERMISSION_MODE` | `--permission-mode` value (`default` / `acceptEdits` / `plan` / `auto` / `dontAsk` / `bypassPermissions` / empty) |
 | `MAX_TURNS` | Max agent turns per request (empty = unlimited) |
 | `MAX_BUDGET_USD` | Max USD cost per request (empty = unlimited) |
