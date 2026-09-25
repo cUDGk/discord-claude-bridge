@@ -137,6 +137,7 @@ python bot.py
 | `/bridge-cancel` | Kill the running claude in this thread |
 | `/bridge-retry` | Re-run the last message |
 | `/bridge-cwd [path]` | Pin working directory (empty to clear) |
+| `/model` | Pick the model for this thread (list fetched from the Models API at startup) |
 | `/bridge-reset-perms` | Clear "always allow" tools for this thread |
 | `/bridge-usage` | Show cumulative tokens / USD cost |
 | `/bridge-archive` | Archive this thread |

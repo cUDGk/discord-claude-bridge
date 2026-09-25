@@ -34,6 +34,7 @@ except (AttributeError, OSError):
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+import aiohttp
 from aiohttp import web
 
 load_dotenv()
@@ -219,6 +220,10 @@ atexit.register(_remove_pid_file)
 
 # /cwd で固定された thread → cwd
 thread_cwds: dict[int, str] = {}
+# /model で選ばれた thread → モデルID（未設定なら CLAUDE_MODEL）
+thread_models: dict[int, str] = {}
+# 起動時に Models API から取得した (id, display_name)。/model の選択肢
+available_models: list[tuple[str, str]] = []
 # /usage 用の累積使用量 (thread → {"input_tokens": N, "output_tokens": N, "cost_usd": float, "turns": N})
 usage_stats: dict[int, dict] = {}
 # /retry 用の直前 prompt (thread → prompt 本文)
@@ -1108,14 +1113,14 @@ def _safe_wait(proc: subprocess.Popen):
         pass
 
 
-def _build_claude_args(prompt: str, session_id: str | None, settings_path: str) -> list[str]:
+def _build_claude_args(prompt: str, session_id: str | None, settings_path: str, model: str) -> list[str]:
     args = [
         CLAUDE_BIN, "-p",
         "--output-format", "stream-json",
         "--verbose",
     ]
-    if CLAUDE_MODEL:
-        args.extend(["--model", CLAUDE_MODEL])
+    if model:
+        args.extend(["--model", model])
     if SKIP_PERMISSIONS:
         args.append("--dangerously-skip-permissions")
     elif PERMISSION_MODE:
@@ -1291,7 +1296,8 @@ async def run_claude(
 
     if not session_id and thread_title:
         prompt = f"[スレッドタイトル: {thread_title}]\n\n{prompt}"
-    args = _build_claude_args(prompt, session_id, settings_path)
+    model = (thread_models.get(thread.id) if thread else None) or CLAUDE_MODEL
+    args = _build_claude_args(prompt, session_id, settings_path, model)
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
@@ -1697,6 +1703,28 @@ async def _validate_startup_targets():
         )
 
 
+async def _fetch_available_models():
+    """Claude Code の OAuth トークンで Models API を叩き、/model の選択肢を available_models に入れる。
+    API キーは無い前提。トークン期限切れ等で失敗したら warning を出して空のまま（/model がその旨を返す）"""
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        token = json.loads(cred_path.read_text(encoding="utf-8"))["claudeAiOauth"]["accessToken"]
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+        }
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+            async with s.get("https://api.anthropic.com/v1/models?limit=100", headers=headers) as r:
+                r.raise_for_status()
+                data = await r.json()
+    except (OSError, KeyError, ValueError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("モデル一覧の取得に失敗: %s", e)
+        return
+    available_models[:] = [(m["id"], m.get("display_name") or m["id"]) for m in data.get("data", [])]
+    log.info("モデル一覧: %s", [m[0] for m in available_models])
+
+
 _synced_once = False
 
 
@@ -1725,6 +1753,7 @@ async def on_ready():
         + (f" / --permission-mode {PERMISSION_MODE}" if PERMISSION_MODE else ""),
     )
     await _validate_startup_targets()
+    await _fetch_available_models()
     # 既存 bridge セッションもネイティブ /resume に出すため起動時に一括 promote。
     # bot が応答を捌き始めてから、専用プールで直列処理（default executor を奪わない）。
     asyncio.create_task(_promote_all_sessions())
@@ -2145,6 +2174,7 @@ async def show_help(interaction: discord.Interaction):
             "`/bridge-cancel` — 走行中の claude を kill\n"
             "`/bridge-retry` — 直前のメッセージを再実行\n"
             "`/bridge-cwd [path]` — このスレッドの作業ディレクトリを固定/解除\n"
+            "`/model` — このスレッドのモデルを選択（一覧は起動時に取得）\n"
             "`/bridge-reset-perms` — このスレッドで「常に許可」したツールを全クリア\n"
             "`/bridge-usage` — このスレッドの累積トークン/コスト\n"
             "`/bridge-archive` — このスレッドをアーカイブ"
@@ -2216,6 +2246,8 @@ async def cmd_info(interaction: discord.Interaction):
     embed = discord.Embed(title="スレッド情報", color=discord.Color.blurple())
     embed.add_field(name="セッションID", value=f"`{sid}`" if sid else "（無し）", inline=False)
     embed.add_field(name="cwd", value=f"`{cwd}`" + (" (固定)" if cwd_fixed else ""), inline=False)
+    model = thread_models.get(thread.id) or CLAUDE_MODEL
+    embed.add_field(name="モデル", value=f"`{model}`" if model else "（claude のデフォルト）", inline=False)
     embed.add_field(name="状態", value=running, inline=True)
     embed.add_field(name="ターン数", value=str(stats.get("turns", 0)), inline=True)
     embed.add_field(name="常に許可済", value=", ".join(allowed) if allowed else "（無し）", inline=False)
@@ -2277,6 +2309,53 @@ async def cmd_cwd(interaction: discord.Interaction, path: str = ""):
         return
     thread_cwds[thread.id] = p
     await interaction.response.send_message(f"📌 cwd を固定: `{p}`", ephemeral=True)
+
+
+_MODEL_DEFAULT = "__default__"
+
+
+class ModelSelect(discord.ui.Select):
+    """起動時に取得した available_models から、このスレッドで使うモデルを選ぶドロップダウン"""
+
+    def __init__(self, thread_id: int):
+        self.thread_id = thread_id
+        current = thread_models.get(thread_id)
+        default_label = f"デフォルト ({CLAUDE_MODEL})" if CLAUDE_MODEL else "デフォルト (claude の既定)"
+        options = [discord.SelectOption(label=default_label, value=_MODEL_DEFAULT, default=current is None)]
+        # Discord の Select は最大 25 件
+        options += [
+            discord.SelectOption(label=name, value=mid, description=mid, default=mid == current)
+            for mid, name in available_models[:24]
+        ]
+        super().__init__(placeholder="モデルを選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) not in ALLOWED_USERS:
+            await interaction.response.send_message("権限がありません", ephemeral=True)
+            return
+        choice = self.values[0]
+        if choice == _MODEL_DEFAULT:
+            thread_models.pop(self.thread_id, None)
+            msg = "🔁 モデルをデフォルトに戻しました"
+        else:
+            thread_models[self.thread_id] = choice
+            msg = f"🧠 モデルを `{choice}` に変更しました（次のメッセージから反映）"
+        await interaction.response.edit_message(content=msg, view=None)
+
+
+@bot.tree.command(name="model", description="このスレッドで使うモデルを選ぶ")
+async def cmd_model(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    if not available_models:
+        await interaction.response.send_message("❌ モデル一覧を取得できていません（起動ログを確認）", ephemeral=True)
+        return
+    view = discord.ui.View(timeout=120)
+    view.add_item(ModelSelect(thread.id))
+    current = thread_models.get(thread.id) or CLAUDE_MODEL or "claude の既定"
+    await interaction.response.send_message(f"現在のモデル: `{current}`", view=view, ephemeral=True)
 
 
 @bot.tree.command(name="bridge-reset-perms", description="このスレッドで「常に許可」したツールを全クリアする")

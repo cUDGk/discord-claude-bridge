@@ -136,6 +136,7 @@ python bot.py
 | `/bridge-cancel` | 走行中の claude を kill |
 | `/bridge-retry` | 直前のメッセージを再実行 |
 | `/bridge-cwd [path]` | 作業ディレクトリを固定（空文字で解除） |
+| `/model` | このスレッドのモデルを選択（一覧は起動時に Models API から取得） |
 | `/bridge-reset-perms` | 「常に許可」したツールを全クリア |
 | `/bridge-usage` | 累積トークン・USDコスト表示 |
 | `/bridge-archive` | スレッドをアーカイブ |

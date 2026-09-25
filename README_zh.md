@@ -137,6 +137,7 @@ python bot.py
 | `/bridge-cancel` | 杀掉本主题帖运行中的 claude |
 | `/bridge-retry` | 重新执行上一条消息 |
 | `/bridge-cwd [path]` | 固定工作目录（空清除） |
+| `/model` | 选择此线程使用的模型（列表在启动时从 Models API 获取） |
 | `/bridge-reset-perms` | 清除「始终允许」的工具列表 |
 | `/bridge-usage` | 累计 token / 美元费用 |
 | `/bridge-archive` | 归档本主题帖 |
